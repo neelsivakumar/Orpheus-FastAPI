@@ -44,14 +44,15 @@ ensure_env_file_exists()
 # Load environment variables from .env file
 load_dotenv(override=True)
 
-from fastapi import FastAPI, Request, Form, HTTPException, Depends
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi import FastAPI, Request, Form, HTTPException, Depends, BackgroundTasks
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from contextlib import asynccontextmanager
 from pydantic import BaseModel
 import json
 
-from tts_engine import generate_speech_from_api, AVAILABLE_VOICES, DEFAULT_VOICE, VOICE_TO_LANGUAGE, AVAILABLE_LANGUAGES
+from tts_engine import generate_speech_from_api, generate_speech_streaming, ACTIVE_REQUESTS, AVAILABLE_VOICES, DEFAULT_VOICE, VOICE_TO_LANGUAGE, AVAILABLE_LANGUAGES
 
 # Create FastAPI app
 app = FastAPI(
@@ -82,12 +83,88 @@ class SpeechRequest(BaseModel):
     voice: str = DEFAULT_VOICE
     response_format: str = "wav"
     speed: float = 1.0
+    stream: bool = False
+    request_id: Optional[str] = None
 
 class APIResponse(BaseModel):
     status: str
     voice: str
     output_file: str
     generation_time: float
+
+# Add a new endpoint to handle cancellation requests
+@app.post("/v1/audio/cancel")
+async def cancel_speech_generation(request: Request):
+    """Cancel an ongoing speech generation request"""
+    data = await request.json()
+    request_id = data.get("request_id")
+    
+    if not request_id:
+        raise HTTPException(status_code=400, detail="Missing request_id parameter")
+    
+    # Mark this request as cancelled in our tracking dictionary
+    ACTIVE_REQUESTS[request_id] = {"cancelled": True}
+    print(f"🛑 Request {request_id} marked for cancellation")
+    
+    return {"status": "ok", "message": f"Request {request_id} cancellation processed"}
+
+# OpenAI-compatible API endpoint
+@app.post("/v1/audio/speechByStream")
+async def create_speech_api(request: SpeechRequest, background_tasks: BackgroundTasks):
+    """
+    Generate speech from text using the Orpheus TTS model.
+    Compatible with OpenAI's /v1/audio/speechByStream endpoint.
+    Always uses streaming for better responsiveness.
+    """
+    if not request.input:
+        raise HTTPException(status_code=400, detail="Missing input text")
+    
+    # Generate unique timestamp for filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Get or create request_id
+    request_id = request.request_id or f"orpheus_{timestamp}"
+    
+    # Register this request in our active requests
+    ACTIVE_REQUESTS[request_id] = {"cancelled": False}
+    
+    # Check if we should use batched generation
+    use_batching = len(request.input) > 500
+    if use_batching:
+        print(f"Using batched generation for long text ({len(request.input)} characters)")
+    
+    # Background task to clean up after request is done
+    async def cleanup_request():
+        await asyncio.sleep(60)  # Wait 60 seconds before cleanup
+        if request_id in ACTIVE_REQUESTS:
+            del ACTIVE_REQUESTS[request_id]
+    
+    background_tasks.add_task(cleanup_request)
+    
+    # Create generator function for streaming audio chunks
+    async def generate_audio_stream():
+        """Generator that yields audio chunks as they're produced"""
+        async for audio_chunk in generate_speech_streaming(
+            prompt=request.input,
+            voice=request.voice,
+            use_batching=use_batching,
+            max_batch_chars=500, # Process in ~500 character chunks (roughly a brief paragraph)
+            request_id=request_id
+        ):
+            # Check if this request has been cancelled
+            if request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                print(f"🛑 Request {request_id} cancelled, stopping generation")
+                break
+                
+            # Yield each chunk as it becomes available
+            yield audio_chunk
+            
+    # Return a streaming response
+    return StreamingResponse(
+        generate_audio_stream(),
+        media_type="audio/wav",
+        headers={"Content-Disposition": f"attachment; filename={request.voice}_{timestamp}.wav"}
+    )
 
 # OpenAI-compatible API endpoint
 @app.post("/v1/audio/speech")
@@ -96,7 +173,7 @@ async def create_speech_api(request: SpeechRequest):
     Generate speech from text using the Orpheus TTS model.
     Compatible with OpenAI's /v1/audio/speech endpoint.
     
-    For longer texts (>1000 characters), batched generation is used
+    For longer texts (>500 characters), batched generation is used
     to improve reliability and avoid truncation issues.
     """
     if not request.input:
@@ -107,7 +184,7 @@ async def create_speech_api(request: SpeechRequest):
     output_path = f"outputs/{request.voice}_{timestamp}.wav"
     
     # Check if we should use batched generation
-    use_batching = len(request.input) > 1000
+    use_batching = len(request.input) > 500
     if use_batching:
         print(f"Using batched generation for long text ({len(request.input)} characters)")
     
@@ -118,7 +195,7 @@ async def create_speech_api(request: SpeechRequest):
         voice=request.voice,
         output_file=output_path,
         use_batching=use_batching,
-        max_batch_chars=1000  # Process in ~1000 character chunks (roughly 1 paragraph)
+        max_batch_chars=500  # Process in ~500 character chunks (roughly a brief paragraph)
     )
     end = time.time()
     generation_time = round(end - start, 2)
@@ -158,9 +235,9 @@ async def speak(request: Request):
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = f"outputs/{voice}_{timestamp}.wav"
-    
+       
     # Check if we should use batched generation for longer texts
-    use_batching = len(text) > 1000
+    use_batching = len(text) > 500
     if use_batching:
         print(f"Using batched generation for long text ({len(text)} characters)")
     
@@ -171,7 +248,7 @@ async def speak(request: Request):
         voice=voice, 
         output_file=output_path,
         use_batching=use_batching,
-        max_batch_chars=1000
+        max_batch_chars=500
     )
     end = time.time()
     generation_time = round(end - start, 2)
@@ -322,7 +399,7 @@ async def generate_from_web(
     output_path = f"outputs/{voice}_{timestamp}.wav"
     
     # Check if we should use batched generation for longer texts
-    use_batching = len(text) > 1000
+    use_batching = len(text) > 500
     if use_batching:
         print(f"Using batched generation for long text from web form ({len(text)} characters)")
     
@@ -333,7 +410,7 @@ async def generate_from_web(
         voice=voice, 
         output_file=output_path,
         use_batching=use_batching,
-        max_batch_chars=1000
+        max_batch_chars=500
     )
     end = time.time()
     generation_time = round(end - start, 2)

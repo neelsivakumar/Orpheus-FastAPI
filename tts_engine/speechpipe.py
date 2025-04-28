@@ -248,8 +248,8 @@ async def tokens_decoder(token_gen):
                         continue
                     
                     # Debug output to help diagnose issues
-                    if count % 28 == 0:
-                        print(f"Processing buffer with {len(buffer_to_proc)} tokens, total collected: {len(buffer)}")
+                    #if count % 28 == 0:
+                        #print(f"Processing buffer with {len(buffer_to_proc)} tokens, total collected: {len(buffer)}")
                     
                     # Process the tokens
                     audio_samples = convert_to_audio(buffer_to_proc, count)

@@ -173,6 +173,9 @@ VOICE_TO_LANGUAGE.update({voice: "italian" for voice in ITALIAN_VOICES})
 # Languages list for the UI
 AVAILABLE_LANGUAGES = ["english", "french", "german", "korean", "hindi", "mandarin", "spanish", "italian"]
 
+# Add a global dictionary to track active requests and their cancellation status
+ACTIVE_REQUESTS = {}
+
 # Import the unified token handling from speechpipe
 from .speechpipe import turn_token_into_id, CUSTOM_TOKEN_PREFIX
 
@@ -312,7 +315,7 @@ def generate_tokens_from_api(prompt: str, voice: str = DEFAULT_VOICE, temperatur
                         try:
                             data = json.loads(data_str)
                             if 'choices' in data and len(data['choices']) > 0:
-                                token_chunk = data['choices'][0].get('text', '')
+                                token_chunk = data['choices'][0].get('text', '')                               
                                 for token_text in token_chunk.split('>'):
                                     token_text = f'{token_text}>'
                                     token_counter += 1
@@ -351,9 +354,171 @@ def generate_tokens_from_api(prompt: str, voice: str = DEFAULT_VOICE, temperatur
             else:
                 print("Max retries reached. Token generation failed.")
                 return
+                   
+async def generate_speech_streaming(prompt, voice=DEFAULT_VOICE, temperature=TEMPERATURE,
+                           top_p=TOP_P, max_tokens=MAX_TOKENS,
+                           use_batching=True, max_batch_chars=500,
+                           request_id=None):
+    """Generate speech with streamed audio chunks, yielding each chunk as soon as it's available."""
+    print(f"Starting streamed speech generation for '{prompt[:50]}{'...' if len(prompt) > 50 else ''}' (request_id: {request_id})")
 
-# The turn_token_into_id function is now imported from speechpipe.py
-# This eliminates duplicate code and ensures consistent behavior
+    # Reset performance monitor
+    global perf_monitor
+    perf_monitor = PerformanceMonitor()
+
+    # --- Batching Logic (Remains the same) ---
+    if use_batching and len(prompt) >= max_batch_chars:
+        # ... (batching code as before, no changes needed here) ...
+        sentences = split_text_into_sentences(prompt)
+        print(f"Split text into {len(sentences)} segments for batched streaming")
+        batches = []
+        current_batch = ""
+        for sentence in sentences:
+            if len(current_batch) + len(sentence) > max_batch_chars and current_batch:
+                batches.append(current_batch)
+                current_batch = sentence
+            else:
+                if current_batch: current_batch += " "
+                current_batch += sentence
+        if current_batch: batches.append(current_batch)
+        print(f"Created {len(batches)} batches for streaming")
+        for i, batch in enumerate(batches):
+            if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                print(f"🛑 Audio generation for request {request_id} cancelled before batch {i+1}")
+                break
+            print(f"Processing batch {i+1}/{len(batches)} ({len(batch)} characters)")
+            async for audio_chunk in generate_speech_streaming(
+                prompt=batch, voice=voice, temperature=temperature, top_p=top_p,
+                max_tokens=max_tokens, use_batching=False,
+                request_id=request_id
+            ):
+                if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                    print(f"🛑 Audio generation for request {request_id} cancelled during batch {i+1} yield")
+                    break
+                yield audio_chunk
+            if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                print(f"🛑 Audio generation for request {request_id} cancelled after batch {i+1}")
+                break
+    # --- Non-Batching / Single Batch Logic --- 
+    else:
+        print("Using direct streaming mode with producer/consumer tasks")
+        audio_queue = asyncio.Queue(maxsize=50) # Async queue
+        producer_task = None
+
+        async def _audio_chunk_producer():
+            """Task to generate tokens and put audio chunks into the queue."""
+            nonlocal producer_task # To allow cancellation check
+            try:
+                # --- Use sync token generator in a thread --- 
+                print("Using generate_tokens_from_api (sync requests) via asyncio.to_thread")
+                sync_token_gen = await asyncio.to_thread(
+                    generate_tokens_from_api, # Call the sync function
+                    prompt=prompt,
+                    voice=voice,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    repetition_penalty=REPETITION_PENALTY
+                    # No request_id here, cancellation handled by consumer task
+                )
+                
+                # --- Adapter to make sync generator async --- 
+                _SENTINEL = object() # Unique sentinel object
+                async def sync_to_async_generator(sync_gen):
+                    loop = asyncio.get_running_loop()
+                    
+                    def _get_next_item(gen):
+                        """Wrapper to catch StopIteration and return sentinel."""
+                        try:
+                            return next(gen)
+                        except StopIteration:
+                            return _SENTINEL
+                        except Exception as e: # Catch other potential errors from the generator
+                             print(f"Error during sync generator iteration: {e}")
+                             return _SENTINEL # Treat other errors as end-of-stream too
+
+                    while True:
+                         # Check for cancellation before getting next item
+                        if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                            print(f"🛑 sync_to_async_generator for request {request_id} cancelled")
+                            break
+                        try:
+                            # Run the wrapper in the executor
+                            item = await loop.run_in_executor(None, _get_next_item, sync_gen)
+                            
+                            if item is _SENTINEL: # Check for sentinel
+                                break
+                            yield item
+                        except Exception as e: # Catch errors from run_in_executor itself
+                            print(f"Error in sync_to_async_generator run_in_executor: {e}")
+                            break # Stop generation on error
+
+                token_generator = sync_to_async_generator(sync_token_gen)
+                # ---------------------------------------------
+
+                # Await the tokens_decoder and put chunks in the queue
+                async for audio_chunk in tokens_decoder(token_generator, request_id=request_id):
+                     # Check for cancellation before putting into queue
+                    if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                        print(f"🛑 Producer task for request {request_id} cancelled")
+                        break
+                    await audio_queue.put(audio_chunk)
+            except Exception as e:
+                print(f"Error in audio chunk producer: {e}")
+                # Optionally put an error marker in the queue
+            finally:
+                # Signal consumer that production is done
+                await audio_queue.put(None) 
+
+        # Start the producer task
+        producer_task = asyncio.create_task(_audio_chunk_producer())
+
+        # Consumer loop: get chunks from queue and yield them
+        while True:
+            try:
+                 # Check for cancellation before waiting on queue
+                if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                    print(f"🛑 Consumer loop for request {request_id} cancelled")
+                    if producer_task and not producer_task.done():
+                         producer_task.cancel()
+                    break
+                
+                # Get chunk with a timeout to allow periodic cancellation checks
+                audio_chunk = await asyncio.wait_for(audio_queue.get(), timeout=1.0) 
+
+                if audio_chunk is None: # Sentinel indicates end of stream
+                    break
+                yield audio_chunk
+                audio_queue.task_done() # Mark task as done
+                
+            except asyncio.TimeoutError:
+                # Timeout allows checking cancellation status periodically
+                if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                    print(f"🛑 Consumer loop for request {request_id} cancelled during timeout wait")
+                    if producer_task and not producer_task.done():
+                        producer_task.cancel()
+                    break
+                # Check if producer task died unexpectedly
+                if producer_task.done() and audio_queue.empty():
+                     print("Producer task finished unexpectedly, exiting consumer.")
+                     break
+                continue # Continue waiting if not cancelled
+            except asyncio.CancelledError:
+                 print(f"Consumer task for request {request_id} received cancellation signal.")
+                 if producer_task and not producer_task.done():
+                      producer_task.cancel()
+                 raise # Re-raise cancellation
+
+        # Ensure producer task is awaited/cleaned up
+        if producer_task and not producer_task.done():
+             try:
+                 await producer_task # Wait for completion or cancellation
+             except asyncio.CancelledError:
+                 print(f"Producer task for {request_id} was cancelled.")
+             except Exception as e:
+                 print(f"Error awaiting producer task: {e}")
+        
+        print(f"Direct streaming via producer/consumer for request {request_id} complete or cancelled")
 
 def convert_to_audio(multiframe: List[int], count: int) -> Optional[bytes]:
     """Convert token frames to audio with performance monitoring."""
@@ -367,7 +532,7 @@ def convert_to_audio(multiframe: List[int], count: int) -> Optional[bytes]:
         
     return result
 
-async def tokens_decoder(token_gen) -> Generator[bytes, None, None]:
+async def tokens_decoder(token_gen, request_id=None) -> Generator[bytes, None, None]:
     """Simplified token decoder with early first-chunk processing for lower latency."""
     buffer = []
     count = 0
@@ -383,6 +548,11 @@ async def tokens_decoder(token_gen) -> Generator[bytes, None, None]:
     token_count = 0
     
     async for token_text in token_gen:
+        # Check cancellation at the start of each token processing loop
+        if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+            print(f"🛑 Token decoding for request {request_id} cancelled")
+            break # Exit the loop
+
         token = turn_token_into_id(token_text, count)
         if token is not None and token > 0:
             # Add to buffer using simple append (reliable method)
@@ -406,8 +576,13 @@ async def tokens_decoder(token_gen) -> Generator[bytes, None, None]:
                     
                     # Process the first chunk for immediate audio feedback
                     print(f"Processing first audio chunk with {len(buffer_to_proc)} tokens")
-                    audio_samples = convert_to_audio(buffer_to_proc, count)
+                    # Run conversion in a separate thread
+                    audio_samples = await asyncio.to_thread(convert_to_audio, buffer_to_proc, count)
                     if audio_samples is not None:
+                        # Check cancellation before yielding
+                        if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                           print(f"🛑 Token decoding for request {request_id} cancelled before yielding first chunk")
+                           break
                         first_chunk_processed = True  # Mark first chunk as processed
                         yield audio_samples
             else:
@@ -417,12 +592,17 @@ async def tokens_decoder(token_gen) -> Generator[bytes, None, None]:
                     buffer_to_proc = buffer[-min_frames_subsequent:]
                     
                     # Debug output to help diagnose issues
-                    if count % 28 == 0:
-                        print(f"Processing buffer with {len(buffer_to_proc)} tokens, total collected: {len(buffer)}")
+                    #if count % 28 == 0:
+                        #print(f"Processing buffer with {len(buffer_to_proc)} tokens, total collected: {len(buffer)}")
                     
                     # Process the tokens
-                    audio_samples = convert_to_audio(buffer_to_proc, count)
+                    # Run conversion in a separate thread
+                    audio_samples = await asyncio.to_thread(convert_to_audio, buffer_to_proc, count)
                     if audio_samples is not None:
+                        # Check cancellation before yielding
+                        if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                           print(f"🛑 Token decoding for request {request_id} cancelled before yielding subsequent chunk")
+                           break
                         yield audio_samples
 
 def tokens_decoder_sync(syn_token_gen, output_file=None):
@@ -671,7 +851,7 @@ def split_text_into_sentences(text):
 
 def generate_speech_from_api(prompt, voice=DEFAULT_VOICE, output_file=None, temperature=TEMPERATURE, 
                      top_p=TOP_P, max_tokens=MAX_TOKENS, repetition_penalty=None, 
-                     use_batching=True, max_batch_chars=1000):
+                     use_batching=True, max_batch_chars=500):
     """Generate speech from text using Orpheus model with performance optimizations."""
     print(f"Starting speech generation for '{prompt[:50]}{'...' if len(prompt) > 50 else ''}'")
     print(f"Using voice: {voice}, GPU acceleration: {'Yes (High-end)' if HIGH_END_GPU else 'Yes' if torch.cuda.is_available() else 'No'}")

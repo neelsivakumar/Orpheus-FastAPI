@@ -337,7 +337,7 @@ The token processing system has been optimized with mathematically aligned param
 ### Long Text Processing
 
 The system features efficient batch processing for texts of any length:
-- Automatically detects longer inputs (>1000 characters) 
+- Automatically detects longer inputs (>500 characters) 
 - Splits text at logical points to create manageable chunks
 - Processes each chunk independently for reliability
 - Combines audio segments with smooth 50ms crossfades
