@@ -45,10 +45,18 @@ services:
       -m /models/${ORPHEUS_MODEL_NAME}
       --port 5006 
       --host 0.0.0.0 
-      --n-gpu-layers 29
+      --n-gpu-layers 999
       --ctx-size ${ORPHEUS_MAX_TOKENS}
       --n-predict ${ORPHEUS_MAX_TOKENS}
-      --rope-scaling linear
+      --rope-scaling linear 
+      -t 8
+      -tb 16
+      -b 1024
+      -ub 1024
+      -fa 
+      --mlock
+      --no-mmap
+      --parallel 2
 
   model-init:
     image: curlimages/curl:latest
@@ -60,9 +68,8 @@ services:
       sh -c '
       if [ ! -f /app/models/${ORPHEUS_MODEL_NAME} ]; then
         echo "Downloading model file..."
-        wget -P /app/models https://huggingface.co/lex-au/${ORPHEUS_MODEL_NAME}/resolve/main/${ORPHEUS_MODEL_NAME}
+        wget -P /app/models --header="Authorization: Bearer ${HF_TOKEN}" https://huggingface.co/lex-au/${ORPHEUS_MODEL_NAME}/resolve/main/${ORPHEUS_MODEL_NAME}
       else
         echo "Model file already exists"
       fi'
     restart: "no"
-    

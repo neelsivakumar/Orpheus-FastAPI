@@ -1,6 +1,7 @@
 import os
 import sys
 import requests
+import httpx
 import json
 import time
 import wave
@@ -11,7 +12,7 @@ import threading
 import queue
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Any, Optional, Generator, Union, Tuple
+from typing import List, Dict, Any, Optional, Generator, AsyncGenerator, Union, Tuple
 from dotenv import load_dotenv
 
 # Helper to detect if running in Uvicorn's reloader
@@ -158,6 +159,9 @@ AVAILABLE_VOICES = (
     ITALIAN_VOICES
 )
 DEFAULT_VOICE = "tara"  # Best voice according to documentation
+
+# Add a global dictionary to track active requests and their cancellation status
+ACTIVE_REQUESTS = {}
 
 # Map voices to languages for the UI
 VOICE_TO_LANGUAGE = {}
@@ -351,6 +355,231 @@ def generate_tokens_from_api(prompt: str, voice: str = DEFAULT_VOICE, temperatur
             else:
                 print("Max retries reached. Token generation failed.")
                 return
+
+async def generate_streaming_tokens_from_api(prompt: str, voice: str = DEFAULT_VOICE, temperature: float = TEMPERATURE,
+                               top_p: float = TOP_P, max_tokens: int = MAX_TOKENS,
+                               repetition_penalty: float = REPETITION_PENALTY,
+                               request_id: str = None) -> AsyncGenerator[str, None]:
+    """Generate tokens from text using OpenAI-compatible API with optimized async streaming and retry logic."""
+    start_time = time.time()
+    formatted_prompt = format_prompt(prompt, voice)
+    print(f"Generating speech for: {formatted_prompt}")
+
+    # Optimize the token generation for GPUs
+    if HIGH_END_GPU:
+        # Use more aggressive parameters for faster generation on high-end GPUs
+        print("Using optimized parameters for high-end GPU")
+    elif torch.cuda.is_available():
+        print("Using optimized parameters for GPU acceleration")
+
+    # Create the request payload
+    payload = {
+        "prompt": formatted_prompt,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "repeat_penalty": repetition_penalty,
+        "stream": True
+    }
+    model_name = os.environ.get("ORPHEUS_MODEL_NAME", "Orpheus-3b-FT-Q4_K_M")
+    payload["model"] = model_name
+
+    retry_count = 0
+    max_retries = 3
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        while retry_count < max_retries:
+            try:
+                # Make the API request with streaming using async client
+                async with client.stream("POST", API_URL, headers=HEADERS, json=payload) as response:
+                    if response.status_code != 200:
+                        error_text = await response.aread()
+                        print(f"Error: API request failed with status code {response.status_code}")
+                        print(f"Error details: {error_text.decode()}")
+                        if response.status_code >= 500:
+                            retry_count += 1
+                            wait_time = 2 ** retry_count
+                            print(f"Retrying in {wait_time} seconds... (attempt {retry_count+1}/{max_retries})")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        return
+
+                    # Process the streamed response asynchronously
+                    token_counter = 0
+                    async for line in response.aiter_lines():
+                        # Check for cancellation before processing each line
+                        if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                            print(f"🛑 Token generation for request {request_id} cancelled during streaming")
+                            await response.aclose()
+                            return
+
+                        if line:
+                            line_str = line
+                            if line_str.startswith('data: '):
+                                data_str = line_str[6:]
+                                if data_str.strip() == '[DONE]':
+                                    break
+                                try:
+                                    data = json.loads(data_str)
+                                    if 'choices' in data and len(data['choices']) > 0:
+                                        token_chunk = data['choices'][0].get('text', '')
+                                        for token_text_part in token_chunk.split('>'):
+                                            if not token_text_part: continue
+                                            # Check for cancellation before yielding each token
+                                            if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                                                print(f"🛑 Token generation for request {request_id} cancelled during token processing")
+                                                await response.aclose()
+                                                return
+
+                                            token_text = f'{token_text_part}>'
+                                            token_counter += 1
+                                            perf_monitor.add_tokens()
+
+                                            if token_text:
+                                                yield token_text
+                                except json.JSONDecodeError as e:
+                                    print(f"Error decoding JSON: {e} on line: {line_str}")
+                                    continue
+
+                    # Generation completed successfully
+                    generation_time = time.time() - start_time
+                    tokens_per_second = token_counter / generation_time if generation_time > 0 else 0
+                    print(f"Token generation complete: {token_counter} tokens in {generation_time:.2f}s ({tokens_per_second:.1f} tokens/sec)")
+                    return
+
+            except httpx.TimeoutException:
+                print(f"Request timed out after {REQUEST_TIMEOUT} seconds")
+                retry_count += 1
+                if retry_count < max_retries:
+                    wait_time = 2 ** retry_count
+                    print(f"Retrying in {wait_time} seconds... (attempt {retry_count+1}/{max_retries})")
+                    await asyncio.sleep(wait_time)
+                else:
+                    print("Max retries reached. Token generation failed.")
+                    return
+
+            except httpx.RequestError as e:
+                print(f"Connection error to API at {API_URL}: {e}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    wait_time = 2 ** retry_count
+                    print(f"Retrying in {wait_time} seconds... (attempt {retry_count+1}/{max_retries})")
+                    await asyncio.sleep(wait_time)
+                else:
+                    print("Max retries reached. Token generation failed.")
+                    return
+
+async def generate_speech_streaming(prompt, voice=DEFAULT_VOICE, temperature=TEMPERATURE,
+                           top_p=TOP_P, max_tokens=MAX_TOKENS,
+                           use_batching=True, max_batch_chars=1000,
+                           request_id=None):
+    """Generate speech with streamed audio chunks, yielding each chunk as soon as it's available."""
+    print(f"Starting streamed speech generation for '{prompt[:50]}{'...' if len(prompt) > 50 else ''}' (request_id: {request_id})")
+
+    # Reset performance monitor
+    global perf_monitor
+    perf_monitor = PerformanceMonitor()
+
+    # For shorter text, use direct streaming
+    if not use_batching or len(prompt) < max_batch_chars:
+        print("Using direct streaming mode")
+
+        # Get tokens asynchronously from the API
+        # No need for the async_token_gen wrapper anymore
+        token_generator = generate_streaming_tokens_from_api( # Now directly returns an AsyncGenerator
+            prompt=prompt,
+            voice=voice,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            repetition_penalty=REPETITION_PENALTY,
+            request_id=request_id
+        )
+
+        # Create a simplified direct decoder that yields chunks immediately
+        buffer = []
+        count = 0
+
+        # Process with early first chunk
+        first_chunk_processed = False
+        min_frames_first = 7
+        min_frames_subsequent = 28
+        process_every = 7
+
+        # Directly use token decoder to get audio chunks by iterating the async generator
+        async for token_text in token_generator: # Iterate directly over the async generator
+            # Check cancellation
+            if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                print(f"🛑 Audio generation for request {request_id} cancelled during processing")
+                break
+
+            token = turn_token_into_id(token_text, count)
+            if token is not None and token > 0:
+                buffer.append(token)
+                count += 1
+
+                if not first_chunk_processed:
+                    if count >= min_frames_first:
+                        buffer_to_proc = buffer[-min_frames_first:]
+                        print(f"Processing first audio chunk with {len(buffer_to_proc)} tokens")
+                        audio_samples = convert_to_audio(buffer_to_proc, count)
+                        if audio_samples is not None:
+                            first_chunk_processed = True
+                            print(f"Yielding first audio chunk...")
+                            if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                                print(f"🛑 Cancelled before yielding first audio chunk for {request_id}")
+                                break
+                            yield audio_samples
+                else:
+                    if count % process_every == 0 and count >= min_frames_subsequent:
+                        buffer_to_proc = buffer[-min_frames_subsequent:]
+                        audio_samples = convert_to_audio(buffer_to_proc, count)
+                        if audio_samples is not None:
+                            if request_id and request_id in ACTIVE_REQUESTS and ACTIVE_REQUESTS[request_id]["cancelled"]:
+                                print(f"🛑 Cancelled before yielding audio chunk for {request_id}")
+                                break
+                            yield audio_samples
+
+        print("Token generation and streaming complete or cancelled")
+
+    else:
+        # For longer text, use batched streaming with cancellation support
+        sentences = split_text_into_sentences(prompt)
+        print(f"Split text into {len(sentences)} segments for batched streaming")
+
+        # Create batches by combining sentences up to max_batch_chars
+        batches = []
+        current_batch = ""
+
+        for sentence in sentences:
+            if len(current_batch) + len(sentence) > max_batch_chars and current_batch:
+                batches.append(current_batch)
+                current_batch = sentence
+            else:
+                if current_batch:
+                    current_batch += " "
+                current_batch += sentence
+
+        if current_batch:
+            batches.append(current_batch)
+
+        print(f"Created {len(batches)} batches for streaming")
+
+        # Process each batch and stream its audio
+        for i, batch in enumerate(batches):
+            print(f"Processing batch {i+1}/{len(batches)} ({len(batch)} characters)")
+
+            # Use the non-batched streaming implementation for each batch
+            async for audio_chunk in generate_speech_streaming( # This recursive call is now fully async
+                prompt=batch,
+                voice=voice,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                use_batching=False,
+                request_id=request_id
+            ):
+                yield audio_chunk
 
 # The turn_token_into_id function is now imported from speechpipe.py
 # This eliminates duplicate code and ensures consistent behavior
